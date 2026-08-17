@@ -1,0 +1,731 @@
+"""
+The agentic query loop — the heart of the search agent.
+
+A while(true) loop with explicit State,
+streaming via AsyncGenerator, tool execution, compaction, and stop hooks.
+
+The loop:
+  1. Check guards (max_turns)
+  2. Compact context if too large
+  3. Call LLM via streaming
+  4. If no tool calls → run stop hooks → break or inject feedback
+  5. Execute tools (parallel for concurrency-safe ones)
+  6. Inject tool results + citations → continue
+
+Interactive tools (ask_user):
+  The generator is bidirectional — it yields StreamEvents and receives
+  user answers via asend(). When a tool returns a "pending_question"
+  in its metadata, the loop yields a USER_QUESTION event and the
+  caller asend()s the user's answer string. This avoids Futures,
+  deadlocks, and background tasks.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import AsyncGenerator
+from urllib.parse import urlsplit, urlunsplit
+
+from src.core.react import ReActContext, ReActEngine, ReActTurn
+from src.core.tool import ToolRegistry
+from src.core.types import (
+    Citation,
+    EventType,
+    LoopState,
+    Message,
+    StreamEvent,
+    ToolResult,
+)
+from src.llm.client import LLMClient
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class QueryParams:
+    """
+    Parameters for a single query loop invocation.
+    Runs a complete research session with tool use and compaction.
+    """
+    query: str
+    system_prompt: str
+    tool_registry: ToolRegistry
+    llm_client: LLMClient
+
+    # Existing conversation history (empty for new sessions)
+    history: list[Message] = field(default_factory=list)
+
+    # Guards
+    max_turns: int = 20
+    max_search: int = 20  # Max search tool calls (web, academic, news)
+    max_fetch: int = 20   # Max web_fetch tool calls
+
+    # Compaction
+    compact_threshold_tokens: int = 80000
+
+    # Session tracking
+    session_id: str = ""
+
+    # Hook engine (injected, optional)
+    hook_engine: object | None = None
+
+    # Rate limiter (injected, optional)
+    rate_limiter: object | None = None
+
+    # Cache directory for oversized tool results
+    cache_dir: str = "./cache"
+
+    # Local-search roots the user opted into via @path mentions (CLI only).
+    # Empty by default: tools that read the filesystem refuse unless a root
+    # is present, so the agent never touches disk without explicit opt-in.
+    allowed_roots: list[str] = field(default_factory=list)
+
+    # StreamEvents normally carry a short tool-result preview for the UI.
+    # Batch tracing can opt into full payloads without changing web behavior.
+    tool_result_preview_chars: int = 500
+    stream_full_tool_results: bool = False
+
+
+async def query_loop(params: QueryParams) -> AsyncGenerator[StreamEvent, str | None]:
+    """
+    The main agentic loop. Streams events to the caller (WebSocket handler).
+
+    This is a bidirectional AsyncGenerator — the caller iterates events
+    and can send values back via asend() for interactive tools (ask_user).
+    Normal events yield None; USER_QUESTION events receive the user's
+    answer string.
+    - while(true) with explicit LoopState
+    - Guards: max_turns
+    - Compact before each LLM call if context is too large
+    - Parallel tool execution for concurrency-safe tools
+    - Stop hooks as quality gates before finalizing
+    """
+    # --- Initialize state ---
+    state = LoopState(
+        messages=list(params.history),
+        turn_count=0,
+        citations=[],
+    )
+
+    # Reset Responses API chain for a fresh session
+    if hasattr(params.llm_client, "reset_response_chain"):
+        params.llm_client.reset_response_chain(session_id=params.session_id)
+
+    # Add the user query as the first message (if not already in history)
+    if not state.messages or state.messages[-1].role != "user":
+        state.messages.append(Message(role="user", content=params.query))
+
+    # Build tool schemas for the LLM
+    tool_schemas = params.tool_registry.get_api_schemas()
+    react = ReActEngine(params.tool_registry, params.llm_client)
+
+    yield StreamEvent(
+        type=EventType.STATUS,
+        data={"message": "Research started"},
+    )
+
+    # Safety valve: if all tool calls are skipped (over-limit) for N
+    # consecutive turns, force _final_answer to prevent infinite loops.
+    _consecutive_all_skipped = 0
+    _force_final = False
+
+    # --- Main loop ---
+    while True:
+        state.turn_count += 1
+
+        # --- Guard: max turns ---
+        if state.turn_count > params.max_turns:
+            yield StreamEvent(
+                type=EventType.STATUS,
+                data={"message": f"Reached maximum turns ({params.max_turns}). Synthesizing final answer..."},
+            )
+            # Give the LLM one last chance to answer (no tools)
+            async for ev in _final_answer(state, params):
+                yield ev
+            break
+
+        # --- Guard: per-tool limits ---
+        # For Responses API (GPT models), we preserve the server-side chain
+        # by continuing the loop and letting per-call filtering inject dummy
+        # results.  Only force _final_answer when BOTH limits are hit or
+        # when using Chat Completions.
+        _use_responses = params.llm_client.uses_responses_api
+
+        if state.search_count >= params.max_search and state.fetch_count >= params.max_fetch:
+            if not _use_responses:
+                # Chat Completions: force final answer
+                yield StreamEvent(
+                    type=EventType.STATUS,
+                    data={"message": "Reached search and fetch limits. Synthesizing final answer..."},
+                )
+                async for ev in _final_answer(state, params):
+                    yield ev
+                break
+            # Responses API: continue loop, safety valve will handle exit
+
+        # Log individual limit warnings (but don't terminate — the agent
+        # can still use the other tool type)
+        if state.search_count >= params.max_search and not _use_responses:
+            if state.search_count == params.max_search:  # Log once
+                yield StreamEvent(
+                    type=EventType.STATUS,
+                    data={"message": f"Search limit reached ({params.max_search}). Continuing with fetch tools..."},
+                )
+
+        if state.fetch_count >= params.max_fetch and not _use_responses:
+            if state.fetch_count == params.max_fetch:  # Log once
+                yield StreamEvent(
+                    type=EventType.STATUS,
+                    data={"message": f"Fetch limit reached ({params.max_fetch}). Continuing with search tools..."},
+                )
+
+        # --- Compaction ---
+        # Skip for Responses API models: the server manages context via
+        # previous_response_id + truncation:"auto".  Local compaction would
+        # delete messages that the server-side chain still references,
+        # causing "No tool output found" errors.
+        if not _use_responses:
+            try:
+                from src.core.compact import should_compact, compact_messages
+                if should_compact(state.messages, params.compact_threshold_tokens):
+                    yield StreamEvent(
+                        type=EventType.STATUS,
+                        data={"message": "Compacting context..."},
+                    )
+                    state.messages = await compact_messages(
+                        state.messages,
+                        params.compact_threshold_tokens,
+                    )
+                    state.compaction_count += 1
+                    yield StreamEvent(
+                        type=EventType.STATUS,
+                        data={"message": f"Context compacted (#{state.compaction_count})"},
+                    )
+            except ImportError:
+                pass  # Compaction not yet implemented — skip
+
+        # --- ReAct Reason: let the model produce a final answer or actions ---
+        react_turn = ReActTurn()
+        async for event in react.reason(
+            state, params.system_prompt, tool_schemas, params.session_id, react_turn
+        ):
+            yield event
+
+        # Skip stop hooks after an API error to avoid error/retry loops.
+        if react_turn.had_error:
+            logger.warning("LLM error occurred, breaking loop (skipping stop hooks)")
+            break
+
+        tool_calls = react_turn.tool_calls
+
+        # --- No tool calls → model wants to stop ---
+        if not tool_calls:
+            # Run stop hooks (quality gate)
+            should_continue, feedback = await _run_stop_hooks(state, params)
+            if should_continue and feedback:
+                # Hook says answer isn't good enough — inject feedback
+                yield StreamEvent(
+                    type=EventType.STATUS,
+                    data={"message": f"Quality check: {feedback}"},
+                )
+                state.messages.append(Message(
+                    role="user",
+                    content=feedback,
+                ))
+                continue
+
+            # All hooks passed (or no hooks) — finalize
+            break
+
+        # --- Execute tool calls ---
+        # Filter out tool calls that would exceed per-tool limits.
+        # The LLM may issue multiple tool calls in one turn, so we must
+        # enforce limits per-call, not just per-turn.
+        allowed_tool_calls: list[dict] = []
+        skipped_tool_calls: list[dict] = []
+        _pending_search = state.search_count
+        _pending_fetch = state.fetch_count
+        for tc in tool_calls:
+            name = tc["tool_name"]
+            if name in ("search_web", "academic_search", "news_search"):
+                if _pending_search >= params.max_search:
+                    skipped_tool_calls.append(tc)
+                    continue
+                _pending_search += 1
+            elif name == "fetch_url":
+                if _pending_fetch >= params.max_fetch:
+                    skipped_tool_calls.append(tc)
+                    continue
+                _pending_fetch += 1
+            allowed_tool_calls.append(tc)
+
+        yield StreamEvent(
+            type=EventType.STATUS,
+            data={"message": f"Executing {len(allowed_tool_calls)} tool(s)..."},
+        )
+
+        tool_results = await react.act(
+            allowed_tool_calls,
+            state,
+            ReActContext(
+                session_id=params.session_id,
+                cache_dir=params.cache_dir,
+                rate_limiter=params.rate_limiter,
+                allowed_roots=params.allowed_roots,
+            ),
+        )
+
+        # Add "limit reached" results for skipped tool calls
+        for tc in skipped_tool_calls:
+            name = tc["tool_name"]
+            if name in ("search_web", "academic_search", "news_search"):
+                msg = "Search limit reached. You cannot perform more searches."
+            elif name == "fetch_url":
+                msg = "Fetch limit reached. You cannot fetch more pages."
+            else:
+                msg = f"{name} limit reached."
+            tool_results.append(ToolResult(
+                data=msg,
+                is_error=False,
+            ))
+            allowed_tool_calls.append(tc)  # re-add so zip() below pairs correctly
+
+        # Safety valve: if ALL tool calls were skipped for too many
+        # consecutive turns, the model is stuck calling over-limit tools.
+        _real_call_count = len(allowed_tool_calls) - len(skipped_tool_calls)
+        if _real_call_count == 0 and skipped_tool_calls:
+            _consecutive_all_skipped += 1
+            if _consecutive_all_skipped >= 3:
+                yield StreamEvent(
+                    type=EventType.STATUS,
+                    data={"message": "All tools at limit for 3 turns. Synthesizing final answer..."},
+                )
+                if not _use_responses:
+                    async for ev in _final_answer(state, params):
+                        yield ev
+                    break
+                # Responses API: let dummy results get injected below,
+                # then add a user nudge. Next iteration will call LLM
+                # with no tools, preserving the chain.
+                _force_final = True
+        else:
+            _consecutive_all_skipped = 0
+
+        # --- Inject tool results into conversation ---
+        # For OpenAI-compatible APIs, tool results go as separate messages
+        # with role="tool" and the tool_call_id
+        for tc, result in zip(allowed_tool_calls, tool_results):
+            # Handle interactive tool (ask_user) — yield question to
+            # the caller and receive the user's answer via asend().
+            pending = result.metadata.get("pending_question")
+            if pending:
+                answer = yield StreamEvent(
+                    type=EventType.USER_QUESTION,
+                    data={
+                        "tool_use_id": tc["tool_use_id"],
+                        "question": pending["question"],
+                        "options": pending["options"],
+                    },
+                )
+                # Default to first option if no answer received
+                if not answer:
+                    answer = pending["options"][0]["label"] if pending["options"] else ""
+                result = ToolResult(data=f"User answered: {answer}")
+
+            # Stream result event to UI. By default this is a preview because
+            # full web_fetch payloads can be very large; the complete result is
+            # still appended to state.messages for the next LLM turn.
+            result_text = result.data or ""
+            if params.stream_full_tool_results:
+                streamed_result = result_text
+            else:
+                streamed_result = result_text[: params.tool_result_preview_chars]
+            yield StreamEvent(
+                type=EventType.TOOL_RESULT,
+                data={
+                    "tool_use_id": tc["tool_use_id"],
+                    "tool_name": tc["tool_name"],
+                    "result": streamed_result,
+                    "result_chars": len(result_text),
+                    "preview": not params.stream_full_tool_results,
+                    "is_error": result.is_error,
+                    "truncated": result.truncated,
+                },
+            )
+
+            # Add to conversation history
+            state.messages.append(Message(
+                role="tool",
+                content=result.data,
+                metadata={
+                    "tool_call_id": tc["tool_use_id"],
+                    "tool_name": tc["tool_name"],
+                },
+            ))
+
+            # Track per-tool counts for limit guards
+            tool_name = tc["tool_name"]
+            if tool_name in ("search_web", "academic_search", "news_search"):
+                state.search_count += 1
+            elif tool_name == "fetch_url":
+                state.fetch_count += 1
+
+            # Accumulate citations
+            for citation in result.citations:
+                state.citations.append(citation)
+                yield StreamEvent(
+                    type=EventType.CITATION,
+                    data=citation.to_dict(),
+                )
+
+        # Emit plan_update event if a research plan exists (tool may have modified it)
+        if state.research_plan is not None:
+            yield StreamEvent(
+                type=EventType.PLAN_UPDATE,
+                data=state.research_plan.to_dict(),
+            )
+
+        # Safety valve: after injecting dummy results, nudge the model
+        # to produce a final answer on the next iteration (no tools).
+        if _force_final:
+            state.messages.append(Message(
+                role="user",
+                content=(
+                    "All tool limits have been reached. You cannot make any more tool calls. "
+                    "Please provide your final answer now based on all the research you have gathered."
+                ),
+            ))
+            tool_schemas = None
+            continue
+
+        # --- Soft nudge: suggest research_plan if not yet used after several searches ---
+        # Only nudge once (check via transition_reason marker)
+        already_nudged = any(
+            "plan_nudge" in (m.metadata.get("_tag", "") or "")
+            for m in state.messages
+        )
+        if not already_nudged:
+            search_count = sum(
+                1 for m in state.messages
+                if m.role == "tool" and m.metadata.get("tool_name") in ("search_web", "academic_search", "news_search")
+            )
+            if state.research_plan is None and search_count >= 3:
+                state.messages.append(Message(
+                    role="user",
+                    content=(
+                        "You've done several searches without creating a research plan. "
+                        "This query appears to have multiple aspects. Please use "
+                        "research_plan(action='create') now to organize your remaining "
+                        "research into sub-tasks before continuing."
+                    ),
+                    metadata={"_tag": "plan_nudge"},
+                ))
+
+    # --- Finalize ---
+    # Build session summary for post-session memory extraction
+    final_answer = state.last_assistant_message or ""
+    plan_findings = ""
+    if state.research_plan and state.research_plan.tasks:
+        plan_findings = "\n".join(
+            f"- {t.title}: {t.findings}"
+            for t in state.research_plan.tasks
+            if t.findings
+        )
+
+    final_citations = _final_citations_for_answer(state.citations, final_answer)
+
+    yield StreamEvent(
+        type=EventType.STATUS,
+        data={
+            "message": f"Research complete. {len(final_citations)} sources cited. "
+                       f"Turns: {state.turn_count}.",
+        },
+    )
+
+    # Condense messages for conversation continuity across turns.
+    # Only user messages and assistant text are kept — tool messages
+    # (research mechanics) are dropped to save context tokens.
+    condensed_history = _condense_for_history(state.messages)
+
+    if hasattr(params.llm_client, "reset_response_chain"):
+        params.llm_client.reset_response_chain(session_id=params.session_id)
+
+    yield StreamEvent(
+        type=EventType.DONE,
+        data={
+            "citations": [c.to_dict() for c in final_citations],
+            "turn_count": state.turn_count,
+            "compaction_count": state.compaction_count,
+            "session_summary": {
+                "query": params.query,
+                "final_answer": final_answer,
+                "plan_findings": plan_findings,
+            },
+            # Condensed history for the next turn's conversation continuity.
+            # Serialized to dicts so the DONE event is JSON-serializable
+            # (ws.send_json would fail on raw Message objects).
+            "final_messages": [
+                {"role": m.role, "content": m.text_content}
+                for m in condensed_history
+            ],
+        },
+    )
+
+
+async def _final_answer(
+    state: LoopState,
+    params: QueryParams,
+) -> AsyncGenerator[StreamEvent, None]:
+    """
+    Make one last LLM call to force a final answer when a guard fires.
+
+    Mirrors the baseline ReAct approach: keep the full conversation history
+    intact (preserves thinking traces, tool_use/tool_result structure, every
+    page fetched), append a user prompt asking for the answer, and pass
+    `tools=schema` + `tool_choice="none"` so the model is forbidden from
+    calling tools but still sees the schema (this prevents DeepSeek-reasoner
+    from emitting native `<｜DSML｜tool_calls>` literals in the answer text,
+    and satisfies Anthropic's "tools= required when history has tool_use"
+    constraint without dropping any context).
+    """
+    use_responses_api = params.llm_client.uses_responses_api
+    final_max_tokens = min(params.llm_client.config.max_tokens, 16384)
+    final_text_parts: list[str] = []
+
+    # Responses API (GPT) path: keep the existing chain-reset behaviour.
+    # The previous_response_id mechanism bakes tool definitions into the
+    # chain, so we must reset and rebuild from a flattened summary —
+    # the Chat Completions trick of sending tools+tool_choice="none"
+    # over the original messages doesn't apply here.
+    if use_responses_api and hasattr(params.llm_client, "_response_ids"):
+        clean_messages = []
+        tool_findings = []
+        for msg in state.messages:
+            if msg.role == "user":
+                clean_messages.append({"role": "user", "content": msg.text_content})
+            elif msg.role == "assistant":
+                text = msg.text_content.strip()
+                if text:
+                    clean_messages.append({"role": "assistant", "content": text})
+            elif msg.role == "tool":
+                tool_name = msg.metadata.get("tool_name", "tool")
+                content = msg.text_content[:500]
+                if content.strip():
+                    tool_findings.append(f"[{tool_name}]: {content}")
+        synthesis_msg = ""
+        if tool_findings:
+            recent = tool_findings[-10:]
+            synthesis_msg += "Here is a summary of your research findings:\n\n"
+            synthesis_msg += "\n\n".join(recent)
+            synthesis_msg += "\n\n---\n\n"
+        synthesis_msg += (
+            "You have reached the limit and cannot make any more tool calls. "
+            "Based on the research you have already gathered, please provide "
+            "the best possible answer to the original question now."
+        )
+        clean_messages.append({"role": "user", "content": synthesis_msg})
+
+        params.llm_client.reset_response_chain(session_id=params.session_id)
+        try:
+            async for event in params.llm_client.stream(
+                messages=clean_messages,
+                system_prompt=params.system_prompt,
+                tools=None,
+                max_tokens=final_max_tokens,
+                session_id=params.session_id,
+            ):
+                if event.type == EventType.TEXT_DELTA:
+                    final_text_parts.append(event.data.get("text", ""))
+                yield event
+        except Exception as e:
+            logger.error(f"Final answer LLM error: {e}")
+            yield StreamEvent(
+                type=EventType.ERROR,
+                data={"message": f"Failed to generate final answer: {str(e)}"},
+            )
+    else:
+        # Chat Completions path (Anthropic, DeepSeek, Azure, copilot-api,
+        # any OpenAI-compatible proxy). Append a user prompt to the existing
+        # message history and let the model answer with the full context.
+        tool_schemas = params.tool_registry.get_api_schemas()
+        state.messages.append(Message(
+            role="user",
+            content=(
+                "You have reached the maximum number of tool uses. "
+                "Please provide your final answer now based on the "
+                "information gathered so far."
+            ),
+        ))
+        api_messages = [msg.to_api_dict() for msg in state.messages]
+        try:
+            async for event in params.llm_client.stream(
+                messages=api_messages,
+                system_prompt=params.system_prompt,
+                tools=tool_schemas if tool_schemas else None,
+                tool_choice="none" if tool_schemas else None,
+                max_tokens=final_max_tokens,
+                session_id=params.session_id,
+            ):
+                if event.type == EventType.TEXT_DELTA:
+                    final_text_parts.append(event.data.get("text", ""))
+                yield event
+        except Exception as e:
+            logger.error(f"Final answer LLM error: {e}")
+            yield StreamEvent(
+                type=EventType.ERROR,
+                data={"message": f"Failed to generate final answer: {str(e)}"},
+            )
+
+    # Append the synthesized answer to state so that
+    # state.last_assistant_message reflects the final answer,
+    # not the mid-research reasoning that preceded the guard.
+    final_text = "".join(final_text_parts)
+    if final_text.strip():
+        state.messages.append(Message(
+            role="assistant",
+            content=final_text,
+        ))    
+
+
+def _final_citations_for_answer(
+    citations: list[Citation],
+    final_answer: str,
+) -> list[Citation]:
+    """
+    Return only sources actually used by the final answer.
+
+    Search/fetch tools discover many candidate citations. The UI's source
+    count should reflect the answer the user sees, so prefer URLs that appear
+    in the final markdown. If the answer contains no URLs, fall back to
+    explicit cite_source registrations.
+    """
+    answer_urls = _extract_urls(final_answer)
+    if answer_urls:
+        citations_by_url: dict[str, Citation] = {}
+        for citation in citations:
+            key = _normalize_url(citation.url)
+            if not key:
+                continue
+            existing = citations_by_url.get(key)
+            if existing is None or (citation.cited and not existing.cited):
+                citations_by_url[key] = citation
+
+        final: list[Citation] = []
+        seen: set[str] = set()
+        for key, raw_url in answer_urls:
+            if key in seen:
+                continue
+            seen.add(key)
+            citation = citations_by_url.get(key)
+            if citation is not None:
+                final.append(citation)
+            else:
+                final.append(Citation(url=raw_url, title=raw_url, snippet="", cited=True))
+        return final
+
+    return _dedupe_citations([citation for citation in citations if citation.cited])
+
+
+def _dedupe_citations(citations: list[Citation]) -> list[Citation]:
+    deduped: list[Citation] = []
+    seen: set[str] = set()
+    for citation in citations:
+        key = _normalize_url(citation.url)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(citation)
+    return deduped
+
+
+def _extract_urls(text: str) -> list[tuple[str, str]]:
+    urls: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"\]\(((?:https?|file)://[^)\s]+)\)", text):
+        raw_url = _clean_url(match.group(1))
+        key = _normalize_url(raw_url)
+        if key and key not in seen:
+            seen.add(key)
+            urls.append((key, raw_url))
+    for match in re.finditer(r"(?:https?|file)://[^\s<>\])]+", text):
+        raw_url = _clean_url(match.group(0))
+        key = _normalize_url(raw_url)
+        if key and key not in seen:
+            seen.add(key)
+            urls.append((key, raw_url))
+    return urls
+
+
+def _clean_url(url: str) -> str:
+    return url.strip().rstrip(".,;:!?\"'")
+
+
+def _normalize_url(url: str) -> str:
+    cleaned = _clean_url(url)
+    if not cleaned:
+        return ""
+    try:
+        parts = urlsplit(cleaned)
+    except ValueError:
+        return cleaned
+    scheme = parts.scheme.lower()
+    netloc = parts.netloc.lower()
+    path = parts.path.rstrip("/") or "/"
+    return urlunsplit((scheme, netloc, path, parts.query, ""))
+
+
+async def _run_stop_hooks(
+    state: LoopState,
+    params: QueryParams,
+) -> tuple[bool, str | None]:
+    """
+    Run stop hooks (quality gates) before finalizing the answer.
+
+    Returns (should_continue, feedback).
+    If should_continue is True, the loop injects feedback and continues.
+
+    Follows the stop hooks pattern — the model thinks it's done,
+    but a quality check might disagree and force another iteration.
+    """
+    if params.hook_engine is None:
+        return False, None
+
+    try:
+        # Hook engine should implement run_stop_hooks(state) -> HookResult
+        hook_engine = params.hook_engine
+        if hasattr(hook_engine, "run_stop_hooks"):
+            result = await hook_engine.run_stop_hooks(state)
+            return result.should_continue, getattr(result, "feedback", None)
+    except Exception as e:
+        logger.warning(f"Stop hook error (ignoring): {e}")
+
+    return False, None
+
+
+def _condense_for_history(messages: list[Message]) -> list[Message]:
+    """
+    Condense loop messages into a compact history for the next turn.
+
+    Keeps user messages and assistant text responses.
+    Drops tool-call details and tool results to save context tokens.
+    Preserves the conversation flow without the research mechanics.
+
+    Messages accumulate across turns, but we strip out the tool
+    interaction details to keep the history lean.
+    """
+    condensed = []
+    for msg in messages:
+        if msg.role == "user":
+            # Keep user messages but skip system injections (plan_nudge, etc.)
+            if not msg.metadata.get("_tag"):
+                condensed.append(msg)
+        elif msg.role == "assistant":
+            # Keep only the text content, drop tool_calls
+            text = msg.text_content.strip()
+            if text:
+                condensed.append(Message(role="assistant", content=text))
+        # Skip tool messages entirely — they're research mechanics,
+        # not conversational context
+    return condensed

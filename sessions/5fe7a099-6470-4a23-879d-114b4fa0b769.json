@@ -1,0 +1,19 @@
+{
+  "session_id": "5fe7a099-6470-4a23-879d-114b4fa0b769",
+  "timestamp": "2026-08-16T17:52:12.250935",
+  "query": "What are the latest advances in quantum computing?",
+  "turns": [
+    {
+      "query": "What are the latest advances in quantum computing?",
+      "final_answer": "",
+      "turn_count": 1,
+      "num_citations": 0
+    }
+  ],
+  "final_answer": "",
+  "plan_findings": "",
+  "turn_count": 1,
+  "compaction_count": 0,
+  "num_citations": 0,
+  "citations": []
+}
