@@ -120,6 +120,7 @@ def build_runtime(settings: dict[str, Any]) -> Runtime:
         "http_timeout": int(tools_cfg.get("http_timeout", 30)),
         "jina_timeout": int(tools_cfg.get("jina_timeout", 60)),
         "content_extraction_threshold": int(tools_cfg.get("content_extraction_threshold", 15000)),
+        "local_retrieval": tools_cfg.get("local_retrieval", {}),
         "browser_search_enabled": browser_enabled and browser_use_for_search,
         "browser_fetch_enabled": browser_enabled and browser_use_for_fetch,
         "browser_mode": browser_cfg.get("mode", "playwright"),

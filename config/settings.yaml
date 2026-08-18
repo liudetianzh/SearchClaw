@@ -110,6 +110,25 @@ tools:
   # extracts key facts and relevant URLs instead of adding raw content.
   # Set to 0 to disable extraction (always use raw truncation).
   content_extraction_threshold: 15000
+  # Local-corpus ReAct mode. When enabled, the agent is given only
+  # search_local and read_local_document; external Google/Jina tools are not
+  # registered. This is intended for reproducible experiments on a fixed
+  # Wikipedia or crawled-web collection.
+  # The default service contract is POST /search with {"query", "top_k"} and
+  # POST /document with {"document_id"}. GET and field names are configurable.
+  local_retrieval:
+    enabled: false
+    base_url: "http://127.0.0.1:8080"
+    search_path: "/search"
+    search_method: "POST"
+    document_path: "/document"
+    document_method: "POST"
+    query_field: "query"
+    top_k_field: "top_k"
+    document_id_field: "document_id"
+    default_top_k: 5
+    max_top_k: 20
+    timeout: 30
 
 skills:
   # Load local SKILL.md files for the main web/API system.

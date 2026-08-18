@@ -181,6 +181,7 @@ tool_registry = build_default_registry(config={
     "http_timeout": _http_timeout,
     "jina_timeout": _jina_timeout,
     "content_extraction_threshold": _content_extraction_threshold,
+    "local_retrieval": _tools_cfg.get("local_retrieval", {}),
     # Browser integration
     "browser_search_enabled": _browser_enabled and _browser_use_for_search,
     "browser_fetch_enabled": _browser_enabled and _browser_use_for_fetch,

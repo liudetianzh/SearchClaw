@@ -199,6 +199,26 @@ llm:
   base_url: "http://localhost:8000/v1"
 ```
 
+### ReAct With a Local Corpus
+
+For reproducible ReAct experiments, enable `tools.local_retrieval`. This
+replaces external web search and Jina fetching with exactly two tools:
+`search_local` and `read_local_document`.
+
+```yaml
+tools:
+  local_retrieval:
+    enabled: true
+    base_url: "http://127.0.0.1:8080"
+```
+
+The default retrieval-service contract is `POST /search` with
+`{"query": "...", "top_k": 5}`, and `POST /document` with
+`{"document_id": "..."}`. Endpoint paths, request methods, and field names
+are configurable in [`config/settings.yaml`](config/settings.yaml), allowing
+the same agent to use a FlashRAG, Wikipedia, or crawled-web index. Configure
+`llm.base_url` to point at vLLM when the model is also served locally.
+
 ### Password Protection
 
 For remote deployments, set a password to protect the UI:

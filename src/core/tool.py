@@ -232,6 +232,40 @@ def build_default_registry(config: dict | None = None) -> ToolRegistry:
         config: Optional dict of tool configuration from settings.yaml.
                 Keys like "web_search_default_results", "http_timeout", etc.
     """
+    cfg = config or {}
+    registry = ToolRegistry()
+    local_retrieval = cfg.get("local_retrieval", {}) or {}
+    if local_retrieval.get("enabled", False):
+        from src.tools.local_corpus import LocalCorpusReadTool, LocalCorpusSearchTool
+
+        base_url = str(local_retrieval.get("base_url", "")).strip()
+        if not base_url.startswith(("http://", "https://")):
+            raise ValueError(
+                "tools.local_retrieval.base_url must be an http:// or https:// URL when enabled"
+            )
+
+        registry.register(LocalCorpusSearchTool(
+            base_url=base_url,
+            search_path=local_retrieval.get("search_path", "/search"),
+            search_method=local_retrieval.get("search_method", "POST"),
+            query_field=local_retrieval.get("query_field", "query"),
+            top_k_field=local_retrieval.get("top_k_field", "top_k"),
+            default_top_k=int(local_retrieval.get("default_top_k", 5)),
+            max_top_k=int(local_retrieval.get("max_top_k", 20)),
+            timeout=int(local_retrieval.get("timeout", cfg.get("http_timeout", 30))),
+            max_result_size_chars=cfg.get("max_result_size_chars", 20000),
+        ))
+        registry.register(LocalCorpusReadTool(
+            base_url=base_url,
+            document_path=local_retrieval.get("document_path", "/document"),
+            document_method=local_retrieval.get("document_method", "POST"),
+            document_id_field=local_retrieval.get("document_id_field", "document_id"),
+            timeout=int(local_retrieval.get("timeout", cfg.get("http_timeout", 30))),
+            max_result_size_chars=cfg.get("max_result_size_chars", 50000),
+        ))
+        logger.info("Registered local-corpus ReAct tools from %s", base_url)
+        return registry
+
     from src.tools.web_search import WebSearchTool
     from src.tools.web_fetch import WebFetchTool
     from src.tools.deep_read import DeepReadTool
@@ -239,9 +273,6 @@ def build_default_registry(config: dict | None = None) -> ToolRegistry:
     from src.tools.research_plan import ResearchPlanTool
     from src.tools.ask_user import AskUserTool
 
-    cfg = config or {}
-
-    registry = ToolRegistry()
     registry.register(WebSearchTool(
         default_results=cfg.get("web_search_default_results", 10),
         max_results=cfg.get("web_search_max_results", 20),

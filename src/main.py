@@ -70,24 +70,30 @@ def main():
         )
 
     # Check for API keys
-    if not os.environ.get("SERPER_API_KEY"):
+    _local_retrieval_enabled = bool(_cfg.get("tools", {}).get("local_retrieval", {}).get("enabled", False))
+    if not _local_retrieval_enabled and not os.environ.get("SERPER_API_KEY"):
         logger.warning(
             "SERPER_API_KEY not set — web search will use DuckDuckGo fallback. "
             "Set SERPER_API_KEY for better results."
         )
 
-    if not os.environ.get("JINA_API_KEY"):
+    if not _local_retrieval_enabled and not os.environ.get("JINA_API_KEY"):
         logger.warning(
             "JINA_API_KEY not set — web_fetch will use direct fetch + local extraction. "
             "Set JINA_API_KEY for better content extraction (JS-rendered pages, PDFs)."
         )
 
-    if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY")):
+    _local_llm_endpoint = bool(_cfg.get("llm", {}).get("base_url", ""))
+    if not _local_llm_endpoint and not (
+        os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    ):
         logger.error(
             "No LLM API key found. Set ANTHROPIC_API_KEY or OPENAI_API_KEY. "
-            "The agent will not work without an LLM provider."
+            "Alternatively, configure llm.base_url for a local OpenAI-compatible server."
         )
         sys.exit(1)
+    if _local_llm_endpoint:
+        logger.info("Using configured OpenAI-compatible LLM endpoint: %s", _cfg["llm"]["base_url"])
 
     # Browser integration status
     _browser_enabled_cfg = _cfg.get("browser", {}).get("enabled", False)

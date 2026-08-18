@@ -63,6 +63,8 @@ TOOL_STYLE: dict[str, tuple[str, str]] = {
     "news_search": ("📰", ACCENT),
     "wechat_search": ("💬", ACCENT),
     "fetch_url": ("📄", BRAND),
+    "search_local": ("🔍", ACCENT),
+    "read_local_document": ("📄", BRAND),
     "deep_read": ("🔬", BRAND),
     "local_glob": ("📂", ACCENT),
     "local_search": ("📁", ACCENT),

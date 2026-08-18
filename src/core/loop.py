@@ -42,6 +42,9 @@ from src.llm.client import LLMClient
 
 logger = logging.getLogger(__name__)
 
+SEARCH_TOOL_NAMES = ("search_web", "academic_search", "news_search", "search_local")
+FETCH_TOOL_NAMES = ("fetch_url", "read_local_document")
+
 
 @dataclass
 class QueryParams:
@@ -249,12 +252,12 @@ async def query_loop(params: QueryParams) -> AsyncGenerator[StreamEvent, str | N
         _pending_fetch = state.fetch_count
         for tc in tool_calls:
             name = tc["tool_name"]
-            if name in ("search_web", "academic_search", "news_search"):
+            if name in SEARCH_TOOL_NAMES:
                 if _pending_search >= params.max_search:
                     skipped_tool_calls.append(tc)
                     continue
                 _pending_search += 1
-            elif name == "fetch_url":
+            elif name in FETCH_TOOL_NAMES:
                 if _pending_fetch >= params.max_fetch:
                     skipped_tool_calls.append(tc)
                     continue
@@ -280,9 +283,9 @@ async def query_loop(params: QueryParams) -> AsyncGenerator[StreamEvent, str | N
         # Add "limit reached" results for skipped tool calls
         for tc in skipped_tool_calls:
             name = tc["tool_name"]
-            if name in ("search_web", "academic_search", "news_search"):
+            if name in SEARCH_TOOL_NAMES:
                 msg = "Search limit reached. You cannot perform more searches."
-            elif name == "fetch_url":
+            elif name in FETCH_TOOL_NAMES:
                 msg = "Fetch limit reached. You cannot fetch more pages."
             else:
                 msg = f"{name} limit reached."
@@ -367,9 +370,9 @@ async def query_loop(params: QueryParams) -> AsyncGenerator[StreamEvent, str | N
 
             # Track per-tool counts for limit guards
             tool_name = tc["tool_name"]
-            if tool_name in ("search_web", "academic_search", "news_search"):
+            if tool_name in SEARCH_TOOL_NAMES:
                 state.search_count += 1
-            elif tool_name == "fetch_url":
+            elif tool_name in FETCH_TOOL_NAMES:
                 state.fetch_count += 1
 
             # Accumulate citations
@@ -409,7 +412,7 @@ async def query_loop(params: QueryParams) -> AsyncGenerator[StreamEvent, str | N
         if not already_nudged:
             search_count = sum(
                 1 for m in state.messages
-                if m.role == "tool" and m.metadata.get("tool_name") in ("search_web", "academic_search", "news_search")
+                if m.role == "tool" and m.metadata.get("tool_name") in SEARCH_TOOL_NAMES
             )
             if state.research_plan is None and search_count >= 3:
                 state.messages.append(Message(
