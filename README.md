@@ -199,6 +199,11 @@ llm:
   base_url: "http://localhost:8000/v1"
 ```
 
+For a Linux + NVIDIA GPU deployment of Qwen 7B through vLLM, see
+[VLLM_LINUX_DEPLOYMENT.md](VLLM_LINUX_DEPLOYMENT.md). The supplied scripts
+start an OpenAI-compatible endpoint and verify it before SearchClaw is pointed
+at the service.
+
 ### ReAct With a Local Corpus
 
 For reproducible ReAct experiments, enable `tools.local_retrieval`. This
